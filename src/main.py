@@ -1,672 +1,909 @@
-from parser import from_word_to_list
-import sqlite3
+import contextlib
 import random
+import sqlite3
 import tkinter as tk
-from tkinter import messagebox
-from tkinter import font
-from tkinter import simpledialog
-from tkinter import scrolledtext
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum, StrEnum
+from tkinter import font, messagebox, scrolledtext, simpledialog
+from urllib.parse import quote
+import requests
+from bs4 import BeautifulSoup
+
+PARTS_OF_SPEECH = [
+    "Noun", "Verb", "Adverb", "Adjective", "Interjection",
+    "Conjunction", "Pronoun", "Preposition", "Numeral", "Proper_noun"
+]
+PAGE_SIZE = 10
+MIN_STAGE = 1
+MAX_STAGE = 15
 
 
-#####################################################################################################################################################
-# AUXILIARY FUNCTIONS
-#####################################################################################################################################################
-def destroy_current_frame():
-    global current_frame
-    if current_frame:
-        current_frame.destroy()
-        current_frame = None
+def _ts(dt):
+    TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+    return dt.astimezone(timezone.utc).strftime(TS_FORMAT)
 
 
-def is_dict_empty():
-    cursor.execute("SELECT COUNT(*) FROM dictionary;")
-    row_count = cursor.fetchone()[0]
-    if row_count == 0:
-        return True
-    else:
+class SortKey(StrEnum):
+    UPDATED = "updated"
+    ALPHABET = "alphabet"
+    CREATED = "created"
+
+
+@dataclass(frozen=True)
+class Word:
+    id: int
+    text: str
+    definition: str
+    created_at: str
+    updated_at: str
+    stage: int
+    revision_date: str
+
+    @classmethod
+    def from_row(cls, row):
+        return cls(*row)
+
+
+@dataclass(frozen=True)
+class WordPage:
+    words: list[Word]
+    total: int
+    page: int
+    page_size: int = PAGE_SIZE
+
+    @property
+    def max_page(self):
+        return max(0, (self.total - 1) // self.page_size)
+
+    @property
+    def has_prev(self):
+        return self.page > 0
+
+    @property
+    def has_next(self):
+        return (self.page + 1) * self.page_size < self.total
+
+
+class Fetcher:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/115.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    def make_unordered_list(self, ol_element):
+        item_symbol = "*"
+        the_list = ol_element.find_all("li", recursive=False)
+        for li in the_list:
+            if li.contents:
+                if isinstance(li.contents[0], str):
+                    li.contents[0].replace_with(
+                        f"{item_symbol} {li.contents[0]}")
+                else:
+                    li.insert(0, f"{item_symbol} ")
+            nested_ol = li.find("ol")
+            if nested_ol:
+                self.make_unordered_list(nested_ol)
+
+    def enumerate_list(self, ol_element):
+        the_list = ol_element.find_all("li", recursive=False)
+        for index, li in enumerate(the_list, start=1):
+            enumeration = f"{index})"
+            if li.contents:
+                if isinstance(li.contents[0], str):
+                    li.contents[0].replace_with(
+                        f"{enumeration} {li.contents[0]}")
+                else:
+                    li.insert(0, f"{enumeration} ")
+            nested_ol = li.find("ol")
+            if nested_ol:
+                self.make_unordered_list(nested_ol)
+
+    def merge_strings(self, input_list):
+        result = []
+        buffer = ""
+        for s in input_list:
+            stripped_str = s.strip()
+            if stripped_str:
+                if stripped_str[0].isdigit():
+                    if buffer:
+                        result.append(buffer)
+                    buffer = s
+                elif stripped_str.startswith("*"):
+                    buffer += " " + s
+        if buffer:
+            result.append(buffer)
+        return result
+
+    def process_def_list(self, def_list):
+        for li in def_list.find_all("li"):
+            first_c = li.find(True)
+            if first_c and first_c.name == "b" and first_c.get_text().strip().isdigit():
+                li.decompose()
+        unwanted_classes = [
+            "citation-whole", "h-usage-example", "Latn mention e-example",
+            "cited-source", "q-hellip-sp", "q-hellip-b", "see-cites",
+            "external text", "mw-empty-elt"
+        ]
+        for unwanted in def_list.find_all(class_=unwanted_classes):
+            unwanted.extract()
+        self.enumerate_list(def_list)
+        remaining_text = def_list.get_text()
+        lines = remaining_text.splitlines()
+        merged_strings = self.merge_strings(lines)
+        return [item.replace("*", "\n*") for item in merged_strings]
+
+    def from_word_to_list(self, word):
+        url = f"https://en.wiktionary.org/wiki/{quote(word.strip())}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code != 200:
+                return None
+            soup = BeautifulSoup(response.content, "html.parser")
+            if not soup.find("h2", string="English"):
+                return None
+            list_of_res = []
+            for i in PARTS_OF_SPEECH:
+                part_section = soup.find(id=i)
+                if part_section:
+                    def_list = part_section.findNext("ol")
+                    if def_list:
+                        processed_list = self.process_def_list(def_list)
+                        if processed_list:
+                            list_of_res.append(i)
+                            list_of_res.extend(processed_list)
+            return " ".join(list_of_res) if list_of_res else None
+        except requests.RequestException:
+            return None
+
+
+class DBStatus(StrEnum):
+    OK = "ok"
+    EXISTS = "exists"
+    NOT_FOUND = "not_found"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class DBResult:
+    code: DBStatus
+    detail: str | None = None
+
+    @property
+    def success(self):
+        return self.code is DBStatus.OK
+
+
+class DBManager:
+    _COLUMNS = "id, word, definition, created_at, updated_at, stage, revision_date"
+    _SORT_COLUMNS = {
+        SortKey.UPDATED: "updated_at",
+        SortKey.ALPHABET: "word COLLATE NOCASE",
+        SortKey.CREATED: "created_at",
+    }
+
+    def __init__(self, db_path="words.db"):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def init_db(self):
+        with contextlib.closing(self.get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS dictionary (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "word TEXT UNIQUE NOT NULL, definition TEXT NOT NULL, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                f"stage INTEGER CHECK (stage BETWEEN {MIN_STAGE} AND {MAX_STAGE}) DEFAULT 1, "
+                "revision_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+            )
+            conn.commit()
+
+    def is_dict_empty(self):
+        with contextlib.closing(self.get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM dictionary;")
+            return cursor.fetchone()[0] == 0
+
+    def get_word(self, word):
+        with contextlib.closing(self.get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT {self._COLUMNS} FROM dictionary WHERE word=?;", (word,))
+            row = cursor.fetchone()
+            return Word.from_row(row) if row else None
+
+    def get_page(self, sort_key, descending, page, page_size=PAGE_SIZE):
+        column = self._SORT_COLUMNS[sort_key]
+        order = "DESC" if descending else "ASC"
+        with contextlib.closing(self.get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM dictionary")
+            total = cursor.fetchone()[0]
+            max_page = max(0, (total - 1) // page_size)
+            page = min(max(0, page), max_page)
+            cursor.execute(
+                f"SELECT {self._COLUMNS} FROM dictionary ORDER BY {column} {order} LIMIT ? OFFSET ?",
+                (page_size, page * page_size),
+            )
+            words = [Word.from_row(r) for r in cursor.fetchall()]
+            return WordPage(words, total, page, page_size)
+
+    def get_words_due(self, cutoff):
+        with contextlib.closing(self.get_connection()) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT {self._COLUMNS} FROM dictionary WHERE revision_date <= ?;",
+                (_ts(cutoff),),
+            )
+            return [Word.from_row(r) for r in cursor.fetchall()]
+
+    def add_word(self, word, definition):
+        try:
+            with contextlib.closing(self.get_connection()) as conn:
+                conn.execute(
+                    "INSERT INTO dictionary (word, definition, updated_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (word, definition),
+                )
+                conn.commit()
+            return DBResult(DBStatus.OK)
+        except sqlite3.IntegrityError:
+            return DBResult(DBStatus.EXISTS)
+        except sqlite3.Error as e:
+            return DBResult(DBStatus.ERROR, str(e))
+
+    def update_word(self, word, definition):
+        try:
+            with contextlib.closing(self.get_connection()) as conn:
+                cursor = conn.execute(
+                    "UPDATE dictionary SET definition = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE word = ?",
+                    (definition, word),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return DBResult(DBStatus.NOT_FOUND)
+            return DBResult(DBStatus.OK)
+        except sqlite3.Error as e:
+            return DBResult(DBStatus.ERROR, str(e))
+
+    def delete_word(self, word):
+        try:
+            with contextlib.closing(self.get_connection()) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM dictionary WHERE word = ?", (word,))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return DBResult(DBStatus.NOT_FOUND)
+            return DBResult(DBStatus.OK)
+        except sqlite3.Error as e:
+            return DBResult(DBStatus.ERROR, str(e))
+
+    def set_stage(self, word, stage, revision_at):
+        try:
+            with contextlib.closing(self.get_connection()) as conn:
+                cursor = conn.execute(
+                    "UPDATE dictionary SET stage = ?, revision_date = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE word = ?;",
+                    (stage, _ts(revision_at), word),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return DBResult(DBStatus.NOT_FOUND)
+            return DBResult(DBStatus.OK)
+        except sqlite3.Error as e:
+            return DBResult(DBStatus.ERROR, str(e))
+
+
+class StudyPlanner:
+    STAGE_INTERVALS = {
+        1: timedelta(0),
+        2: timedelta(minutes=5),
+        3: timedelta(minutes=10),
+        4: timedelta(hours=1),
+        5: timedelta(days=1),
+        6: timedelta(days=3),
+        7: timedelta(days=7),
+        8: timedelta(days=14),
+        9: timedelta(days=21),
+        10: timedelta(days=30),
+        11: timedelta(days=60),
+        12: timedelta(days=90),
+        13: timedelta(days=180),
+        14: timedelta(days=270),
+        15: timedelta(days=365),
+    }
+    LOOKAHEAD_STAGES = (2, 3, 4)
+
+    def __init__(self, db, rng=random):
+        self.db = db
+        self.rng = rng
+
+    def next_word(self, advance_days=0):
+        now = datetime.now(timezone.utc)
+        horizons = [timedelta(days=advance_days)]
+        horizons += [self.STAGE_INTERVALS[s] for s in self.LOOKAHEAD_STAGES]
+        for horizon in horizons:
+            due = self.db.get_words_due(now + horizon)
+            if due:
+                return self.rng.choice(due)
+        return None
+
+    @staticmethod
+    def answer_stages(current_stage):
+        stages = [MIN_STAGE]
+        if current_stage != MIN_STAGE:
+            stages.append(current_stage)
+        stages += [s for s in (current_stage + 1,
+                               current_stage + 2) if s <= MAX_STAGE]
+        return stages
+
+    def reschedule(self, word, stage):
+        stage = min(MAX_STAGE, max(MIN_STAGE, stage))
+        revision_at = datetime.now(timezone.utc) + self.STAGE_INTERVALS[stage]
+        return self.db.set_stage(word, stage, revision_at)
+
+    def reset(self, word):
+        return self.reschedule(word, MIN_STAGE)
+
+
+@dataclass(frozen=True)
+class AddResult:
+    code: DBStatus
+    word: Word | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchAddResult:
+    added: list[str]
+    already_added: list[str]
+    not_found: list[str]
+    failed: list[tuple[str, str | None]]
+
+    @property
+    def has_failures(self):
+        return bool(self.failed)
+
+
+class WordsAdder:
+    def __init__(self, db, fetcher):
+        self.db = db
+        self.fetcher = fetcher
+
+    def add_single_word(self, text):
+        existing = self.db.get_word(text)
+        if existing:
+            return AddResult(DBStatus.EXISTS, existing)
+        definition = self.fetcher.from_word_to_list(text)
+        if not definition:
+            return AddResult(DBStatus.NOT_FOUND)
+        result = self.db.add_word(text, definition)
+        if result.success:
+            return AddResult(DBStatus.OK, self.db.get_word(text))
+        if result.code is DBStatus.EXISTS:
+            return AddResult(DBStatus.EXISTS, self.db.get_word(text))
+        return AddResult(DBStatus.ERROR, detail=result.detail)
+
+    def add_multiple_words(self, words):
+        batch = BatchAddResult(added=[], already_added=[],
+                               not_found=[], failed=[])
+        for text in words:
+            if self.db.get_word(text):
+                batch.already_added.append(text)
+                continue
+            definition = self.fetcher.from_word_to_list(text)
+            if not definition:
+                batch.not_found.append(text)
+                continue
+            result = self.db.add_word(text, definition)
+            if result.success:
+                batch.added.append(text)
+            elif result.code is DBStatus.EXISTS:
+                batch.already_added.append(text)
+            else:
+                batch.failed.append((text, result.detail))
+        return batch
+
+
+class EditMode(Enum):
+    NEW = "new"
+    EXISTING = "existing"
+
+
+@dataclass
+class ListState:
+    sort_key: SortKey = SortKey.CREATED
+    descending: bool = False
+    page: int = 0
+
+
+SORT_LABELS = {
+    SortKey.UPDATED: "дате изменения",
+    SortKey.ALPHABET: "алфавиту",
+    SortKey.CREATED: "дате создания",
+}
+STAGE_LABELS = {
+    1: "<1 мин", 2: "<5 мин", 3: "<1 час", 4: "<1 час", 5: "1 день",
+    6: "3 дня", 7: "7 дней", 8: "14 дней", 9: "21 день", 10: "1 месяц",
+    11: "2 месяца", 12: "3 месяца", 13: "6 месяцев", 14: "9 месяцев", 15: "1 год",
+}
+
+
+class Screen(tk.Frame):
+    def __init__(self, window, controller):
+        super().__init__(window, bg="linen")
+        self.controller = controller
+
+
+class MainMenuUI(Screen):
+    def __init__(self, parent, controller):
+        super().__init__(parent, controller)
+        self.search_entry = tk.Entry(self, width=30)
+        self.search_entry.pack(pady=(60, 20))
+        tk.Button(self, text="Найти слово", width=25,
+                  command=self.on_search).pack(pady=10)
+        tk.Button(self, text="Список слов", width=25,
+                  command=controller.open_word_list).pack(pady=10)
+        tk.Button(self, text="Учить слова", width=25,
+                  command=controller.open_learn).pack(pady=10)
+        tk.Button(self, text="Выйти", width=25,
+                  command=controller.quit).pack(pady=10)
+
+    def on_search(self):
+        request = self.search_entry.get().strip()
+        if request:
+            self.controller.handle_add_request(request)
+
+
+class EditWordUI(Screen):
+    def __init__(self, parent, controller, word, mode, from_list):
+        super().__init__(parent, controller)
+        self.word = word
+        self.mode = mode
+        self.from_list = from_list
+        self.create_widgets()
+
+    def create_widgets(self):
+        tk.Label(self, text=self.word.text, font=(
+            "Arial", 20), bg="linen").pack(pady=15)
+        self.edit_entry = scrolledtext.ScrolledText(self, height=10, width=65)
+        self.edit_entry.insert("1.0", self.word.definition)
+        self.edit_entry.pack(pady=5)
+        self.apply_bold_formatting()
+        self.create_buttons()
+
+    def apply_bold_formatting(self):
+        self.edit_entry.tag_configure(
+            "bold", font=font.Font(size=10, weight="bold"))
+        for pos in PARTS_OF_SPEECH:
+            start_index = "1.0"
+            while True:
+                start_index = self.edit_entry.search(
+                    pos, start_index, stopindex=tk.END)
+                if not start_index:
+                    break
+                end_index = f"{start_index}+{len(pos)}c"
+                self.edit_entry.tag_add("bold", start_index, end_index)
+                start_index = end_index
+
+    def create_buttons(self):
+        c = self.controller
+        button_frame = tk.Frame(self, bg="linen")
+        button_frame.pack(pady=10)
+        tk.Button(button_frame, text="Сохранить",
+                  command=self.save_word).pack(side="left", padx=5)
+        is_new = self.mode is EditMode.NEW
+        tk.Button(
+            button_frame,
+            text="Не сохранять" if is_new else "Удалить",
+            command=lambda: c.delete_word(self.word.text),
+        ).pack(side="left", padx=5)
+        if not is_new:
+            tk.Button(
+                button_frame,
+                text="Обнулить прогресс",
+                command=lambda: c.reset_word_progress(self.word.text),
+            ).pack(side="left", padx=5)
+        nav_frame = tk.Frame(self, bg="linen")
+        nav_frame.pack(pady=5)
+        if self.from_list:
+            tk.Button(nav_frame, text="Список слов",
+                      command=c.return_to_list).pack(side="left", padx=5)
+        tk.Button(nav_frame, text="Главное меню",
+                  command=c.open_main_menu).pack(side="left", padx=5)
+
+    def save_word(self):
+        definition = self.edit_entry.get("1.0", "end-1c")
+        self.controller.save_word_definition(self.word.text, definition)
+
+
+class WordListUI(Screen):
+    def __init__(self, parent, controller, page, state):
+        super().__init__(parent, controller)
+        self.page = page
+        self.state = state
+        self.create_widgets()
+
+    def create_widgets(self):
+        start = self.page.page * self.page.page_size + 1
+        for i, word in enumerate(self.page.words, start=start):
+            tk.Button(
+                self,
+                text=f"{i}) {word.text}",
+                wraplength=500,
+                anchor="center",
+                width=65,
+                command=lambda w=word: self.controller.open_word(w),
+            ).pack(anchor="center", pady=2)
+        self.create_bottom_controls()
+
+    def create_bottom_controls(self):
+        c = self.controller
+        label_to_key = {label: key for key, label in SORT_LABELS.items()}
+        sort_frame = tk.Frame(self, bg="linen")
+        sort_frame.pack(side="bottom", pady=5)
+        selected = tk.StringVar(value=SORT_LABELS[self.state.sort_key])
+        arrow = "↓" if self.state.descending else "↑"
+        tk.Button(
+            sort_frame,
+            text=f"Сортировать по {arrow}",
+            command=lambda: c.sort_by(label_to_key[selected.get()]),
+        ).pack(side="left", padx=2)
+        tk.OptionMenu(sort_frame, selected, *SORT_LABELS.values()
+                      ).pack(side="left", padx=2)
+        nav_frame = tk.Frame(self, bg="linen")
+        nav_frame.pack(side="bottom", pady=2)
+        if self.page.has_prev:
+            tk.Button(nav_frame, text="Назад",
+                      command=c.prev_page).pack(side="left")
+        if self.page.has_prev or self.page.has_next:
+            tk.Label(
+                nav_frame,
+                text=f"Страница {self.page.page + 1}/{self.page.max_page + 1}",
+                bg="linen",
+            ).pack(side="left", padx=5)
+        if self.page.has_next:
+            tk.Button(nav_frame, text="Вперёд",
+                      command=c.next_page).pack(side="left")
+        lower_frame = tk.Frame(self, bg="linen")
+        lower_frame.pack(side="bottom", pady=2)
+        tk.Button(lower_frame, text="Главное меню",
+                  command=c.open_main_menu).pack(side="left", padx=5)
+        if self.page.total > self.page.page_size:
+            page_entry = tk.Entry(lower_frame, width=5)
+            page_entry.pack(side="left", padx=2)
+            tk.Button(
+                lower_frame,
+                text="Перейти",
+                command=lambda: c.jump_to_page(page_entry.get()),
+            ).pack(side="left")
+
+
+class LearnUI(Screen):
+    def __init__(self, parent, controller, word, revealed, answer_stages):
+        super().__init__(parent, controller)
+        self.word = word
+        self.revealed = revealed
+        self.answer_stages = answer_stages
+        self.create_widgets()
+
+    def create_widgets(self):
+        nav_frame = tk.Frame(self, bg="linen")
+        nav_frame.pack(side="top", anchor="w", padx=10, pady=5)
+        tk.Button(nav_frame, text="Главное меню",
+                  command=self.controller.open_main_menu).pack()
+        if not self.revealed:
+            tk.Label(self, text=self.word.text, font=(
+                "Arial", 22), bg="linen").pack(pady=40)
+        else:
+            card = scrolledtext.ScrolledText(
+                self, wrap="word", height=12, width=65)
+            card.pack(side="top", pady=10)
+            card.insert("1.0", self.word.definition)
+        button_frame = tk.Frame(self, bg="linen")
+        button_frame.pack(pady=10, side="bottom")
+        if not self.revealed:
+            tk.Button(
+                button_frame,
+                text="Показать",
+                width=15,
+                command=self.controller.reveal_card,
+            ).pack(side="left", padx=5, pady=20)
+        else:
+            for stage in self.answer_stages:
+                tk.Button(
+                    button_frame,
+                    text=STAGE_LABELS[stage],
+                    command=lambda s=stage: self.controller.grade_word(s),
+                ).pack(side="left", padx=3, pady=10)
+
+
+class MainWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Flashcards App")
+        self.geometry("600x600")
+        self.configure(bg="linen")
+        self.current_frame = None
+
+    def switch_screen(self, frame_class, controller, *args, **kwargs):
+        if self.current_frame is not None:
+            self.current_frame.destroy()
+        self.current_frame = frame_class(self, controller, *args, **kwargs)
+        self.current_frame.pack(fill="both", expand=True)
+
+    def show_message(self, text, title="Уведомление"):
+        messagebox.showinfo(title, text)
+
+    def show_warning(self, text, title="Внимание"):
+        messagebox.showwarning(title, text)
+
+    def show_error(self, text, title="Ошибка"):
+        messagebox.showerror(title, text)
+
+    def ask_advance_days(self):
+        return simpledialog.askstring(
+            "Отлично!",
+            "Все слова на сейчас повторены.\nЕсли хотите, выберите на сколько дней\nхотите идти вперёд плана:",
+        )
+
+
+def _db_error_text(code, detail):
+    _DB_STATUS_TEXT = {
+        DBStatus.NOT_FOUND: "Слово не найдено.",
+        DBStatus.EXISTS: "Такое слово уже есть в словаре.",
+    }
+    if code is DBStatus.ERROR:
+        return f"Ошибка базы данных: {detail}"
+    return _DB_STATUS_TEXT.get(code, "Неизвестная ошибка")
+
+
+def _format_batch(batch):
+    parts = []
+    if batch.added:
+        parts.append(f"Добавлены: {', '.join(batch.added)}")
+    if batch.already_added:
+        parts.append(f"Уже в словаре: {', '.join(batch.already_added)}")
+    if batch.not_found:
+        parts.append(f"Не найдены: {', '.join(batch.not_found)}")
+    if batch.failed:
+        details = "; ".join(f"{w} ({d})" for w, d in batch.failed)
+        parts.append(f"Не удалось сохранить: {details}")
+    return "\n".join(parts)
+
+
+class WordListController:
+    def __init__(self, view, db, router):
+        self.view = view
+        self.db = db
+        self.router = router
+        self.state = ListState()
+        self._page = None
+
+    def show(self):
+        self._page = self.db.get_page(
+            self.state.sort_key, self.state.descending, self.state.page)
+        self.state.page = self._page.page
+        self.view.switch_screen(WordListUI, self, self._page, self.state)
+
+    def sort_by(self, key):
+        if key == self.state.sort_key:
+            self.state.descending = not self.state.descending
+        else:
+            self.state.sort_key = key
+        self.show()
+
+    def next_page(self):
+        self.state.page += 1
+        self.show()
+
+    def prev_page(self):
+        self.state.page -= 1
+        self.show()
+
+    def jump_to_page(self, raw):
+        try:
+            target = int(raw) - 1
+        except ValueError:
+            return
+        if self._page and 0 <= target <= self._page.max_page:
+            self.state.page = target
+            self.show()
+
+    def open_word(self, word):
+        self.router.open_edit(word, EditMode.EXISTING, from_list=True)
+
+    def open_main_menu(self):
+        self.router.open_main_menu()
+
+
+class AddWordController:
+    def __init__(self, view, words_adder, router):
+        self.view = view
+        self.words_adder = words_adder
+        self.router = router
+
+    def handle_add_request(self, request):
+        words = [w.strip() for w in request.split(",") if w.strip()]
+        if len(words) > 1:
+            self._handle_multiple_add(words)
+        elif len(words) == 1:
+            self._handle_single_add(words[0])
+
+    def _handle_single_add(self, text):
+        result = self.words_adder.add_single_word(text)
+        if result.code is DBStatus.OK:
+            self.view.show_message(f'Слово "{text}" найдено онлайн.')
+            self.router.open_edit(result.word, EditMode.NEW, from_list=False)
+        elif result.code is DBStatus.EXISTS:
+            self.view.show_message(f'Слово "{text}" уже есть в словаре.')
+            self.router.open_edit(
+                result.word, EditMode.EXISTING, from_list=False)
+        elif result.code is DBStatus.NOT_FOUND:
+            self.view.show_message(
+                "Слово не найдено в словаре или не является английским.")
+            self.router.open_main_menu()
+        else:
+            self.view.show_error(
+                f'Не удалось добавить слово "{text}".\n{_db_error_text(result.code, result.detail)}'
+            )
+            self.router.open_main_menu()
+
+    def _handle_multiple_add(self, words):
+        batch = self.words_adder.add_multiple_words(words)
+        self.router.open_main_menu()
+        text = _format_batch(batch)
+        if batch.has_failures:
+            self.view.show_warning(text, title="Результаты")
+        else:
+            self.view.show_message(text, title="Результаты")
+
+
+class EditWordController:
+    def __init__(self, view, db, planner, router):
+        self.view = view
+        self.db = db
+        self.planner = planner
+        self.router = router
+        self._from_list = False
+
+    def show(self, word, mode, from_list):
+        self._from_list = from_list
+        self.view.switch_screen(EditWordUI, self, word, mode, from_list)
+
+    def save_word_definition(self, word, definition):
+        result = self.db.update_word(word, definition)
+        if self._report(result, "Определение обновлено."):
+            self._leave_edit()
+
+    def delete_word(self, word):
+        result = self.db.delete_word(word)
+        if self._report(result, "Слово удалено."):
+            self._leave_edit()
+
+    def reset_word_progress(self, word):
+        self._report(self.planner.reset(word), "Прогресс изучения обнулён.")
+
+    def return_to_list(self):
+        self.router.list_ctrl.show()
+
+    def open_main_menu(self):
+        self.router.open_main_menu()
+
+    def _leave_edit(self):
+        if self._from_list:
+            self.router.list_ctrl.show()
+        else:
+            self.router.open_main_menu()
+
+    def _report(self, result, ok_text=None):
+        if result.success:
+            if ok_text:
+                self.view.show_message(ok_text)
+            return True
+        self.view.show_error(_db_error_text(result.code, result.detail))
         return False
 
 
-#####################################################################################################################################################
-# ADDING AND DELETING
-#####################################################################################################################################################
-def add_several_words(list):
-    res = [i.strip() for i in list.split(",")]
-    already_added = []
-    not_found = []
-    added = []
-    for word in res:
-        cursor.execute("SELECT * FROM dictionary WHERE word=?", (word,))
-        dict_tuple = cursor.fetchone()
-        if dict_tuple == None:
-            def_list = from_word_to_list(word, notify=0)
-            if def_list != 1:
-                definition = " ".join(word for sublist in def_list for word in sublist)
-                cursor.execute(
-                    "INSERT INTO dictionary (word, definition, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                    (word, definition),
-                )
-                connection.commit()
-                added.append(word)
-            else:
-                not_found.append(word)
-                continue
-        else:
-            already_added.append(word)
-            continue
-    main_menu()
-    parts = []
-    if added:
-        parts.append(f"Добавлены: {', '.join(map(str, added))}")
-    if already_added:
-        parts.append(f"Уже в словаре: {', '.join(map(str, already_added))}")
-    if not_found:
-        parts.append(f"Не найдены: {', '.join(map(str, not_found))}")
-    messagebox.showinfo("Результаты", "\n".join(parts))
-
-
-def what_to_add(request):
-    if "," in request:
-        add_several_words(request)
-    else:
-        add_word(request)
-
-
-def add_word(word):
-    cursor.execute("SELECT * FROM dictionary WHERE word=?", (word,))
-    dict_tuple = cursor.fetchone()
-
-    if dict_tuple:
-        messagebox.showinfo("Уведомление", f'Слово "{word}" уже есть в словаре.')
-        editing_menu(dict_tuple, buttons_config=2)
-    else:
-        def_list = from_word_to_list(word)
-        if def_list != 1:
-            definition = " ".join(word for sublist in def_list for word in sublist)
-            cursor.execute(
-                "INSERT INTO dictionary (word, definition, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (word, definition),
-            )
-            connection.commit()
-            messagebox.showinfo(
-                "Уведомление",
-                f'Слово "{word}" найдено онлайн, выберите дальнейшие действия.',
-            )
-            cursor.execute("SELECT * FROM dictionary WHERE word=?", (word,))
-            dict_tuple = cursor.fetchone()
-            editing_menu(dict_tuple, buttons_config=1)
-        else:
-            main_menu()
-
-
-def delete_word(word):
-    cursor.execute("DELETE FROM dictionary WHERE word = ?", (word,))
-    connection.commit()
-
-
-#####################################################################################################################################################
-# EDITING MENU FUNCTIONS
-#####################################################################################################################################################
-def editing_menu(dict_tuple, buttons_config=0, list_settings=None):
-    # buttons_config = 0 - all buttons are present, default names;
-    # 1 - two buttons, 2nd button - Не сохранять, for 1st encounter
-    # 2 - two buttons, 2nd button - Удалить (default)
-    destroy_current_frame()
-    edit_frame = tk.Frame(root, bg="linen")
-    edit_frame.pack(fill="both", expand=True)
-    global current_frame
-    current_frame = edit_frame
-
-    the_word = dict_tuple[1]
-    label = tk.Label(edit_frame, text=f"{the_word}", font=("Arial", 20), bg="linen")
-    label.pack(pady=20)
-
-    edit_entry = tk.scrolledtext.ScrolledText(edit_frame, height=10, width=70)
-    edit_entry.insert("1.0", dict_tuple[2])
-    edit_entry.pack()
-
-    embolden(edit_entry)
-    editing_buttons(edit_frame, the_word, edit_entry, list_settings, buttons_config)
-
-
-def embolden(edit_entry):
-    needed_font = font.Font(size=12, weight="bold")
-    edit_entry.tag_configure("bold", font=needed_font)
-
-    parts_of_speech = [
-        "Noun",
-        "Verb",
-        "Adverb",
-        "Adjective",
-        "Interjection",
-        "Conjunction",
-        "Pronoun",
-        "Preposition",
-        "Numeral",
-        "Proper_noun",
-    ]
-    for i in parts_of_speech:
-        start_index = "1.0"
-        while True:
-            start_index = edit_entry.search(i, start_index, stopindex=tk.END)
-            if not start_index:
-                break
-            end_index = f"{start_index}+{len(i)}c"
-            edit_entry.tag_add("bold", start_index, end_index)
-            start_index = end_index
-
-
-def editing_buttons(edit_frame, the_word, edit_entry, list_settings, buttons_config):
-    button_frame = tk.Frame(edit_frame, bg="linen")
-    button_frame.pack()
-
-    button1 = tk.Button(
-        button_frame,
-        text="Сохранить",
-        command=lambda: (
-            update_word(the_word, edit_entry.get("1.0", "end-1c")),
-            main_menu() if list_settings is None else word_list(*list_settings),
-        ),
-    )
-    button1.pack(side="left", padx=5)
-
-    button2 = tk.Button(
-        button_frame,
-        text="Не сохранять" if buttons_config == 1 else "Удалить",
-        command=lambda: (
-            delete_word(the_word),
-            messagebox.showinfo("Уведомление", f"Слово удалено"),
-            word_list(*list_settings) if list_settings else main_menu(),
-        ),
-    )
-    button2.pack(side="left", padx=5)
-    if buttons_config != 1:
-        button3 = tk.Button(
-            button_frame,
-            text="Обнулить прогресс",
-            command=lambda: change_stage(the_word, 1, change_rev_date=None, nullify=1),
-        )
-        button3.pack(side="left", padx=5)
-
-    if buttons_config == 0:
-        sorting_frame = tk.Frame(edit_frame, bg="linen")
-        sorting_frame.pack(pady=10)
-        word_list_button = tk.Button(
-            sorting_frame,
-            text="Список слов",
-            command=lambda: word_list(*list_settings),
-        )
-        word_list_button.pack(side="left", padx=5)
-        back_button = tk.Button(sorting_frame, text="Главное меню", command=main_menu)
-        back_button.pack(side="left", padx=5)
-
-
-def update_word(word, definition):
-    cursor.execute(
-        "UPDATE dictionary SET definition = ?, updated_at = CURRENT_TIMESTAMP WHERE word = ?",
-        (definition, word),
-    )
-    connection.commit()
-
-    cursor.execute("SELECT definition FROM dictionary WHERE word = ?", (word,))
-    result = cursor.fetchone()
-    if result:
-        messagebox.showinfo("Уведомление", f"Данное определение добавлено")
-
-
-#####################################################################################################################################################
-# WORD LIST
-#####################################################################################################################################################
-def word_list(
-    sort_arg="дате создания", prev_sort_arg=None, page=0, order_arg=0, sort_clicked=0
-):
-    list_settings = (sort_arg, prev_sort_arg, page, order_arg, sort_clicked)
-
-    order_arg = switch_order(sort_arg, prev_sort_arg, order_arg, sort_clicked)
-
-    rows, number_of_rows, max_page = get_rows(sort_arg, order_arg, page)
-
-    if rows:
-        word_list_frame = setup_frame_and_list(rows, page, list_settings)
-
-        lower_navigation(word_list_frame, number_of_rows, sort_arg, max_page, page)
-        page_buttons(
-            word_list_frame, page, max_page, number_of_rows, sort_arg, order_arg
-        )
-        sorting_buttons(word_list_frame, sort_arg, order_arg, page)
-
-    else:
-        messagebox.showerror(
-            "Ошибка!", "Словарь пуст. Добавьте слова, чтобы начать их изучение"
-        )
-        main_menu()
-
-
-def switch_order(sort_arg, prev_sort_arg, order_arg, sort_clicked):
-    if prev_sort_arg == sort_arg and sort_clicked == 1:
-        order_arg = (order_arg + 1) % 2
-    return order_arg
-
-
-def get_rows(sort_arg, order_arg, page):
-    sorting_kinds = {
-        "дате изменения": "updated_at ",
-        "алфавиту": "word COLLATE NOCASE ",
-        "дате создания": "created_at ",
-    }
-    order_kinds = {1: "DESC", 0: "ASC"}
-    column_name = sorting_kinds[sort_arg]
-    order = order_kinds[order_arg]
-
-    cursor.execute("SELECT COUNT(*) FROM dictionary")
-    number_of_rows = cursor.fetchone()[0]
-    max_page = (number_of_rows - 1) // 10
-
-    page = min(page, max_page)
-
-    current_range = page * 10
-    cursor.execute(
-        f"SELECT * FROM dictionary ORDER BY {column_name}{order} LIMIT 10 OFFSET {current_range}"
-    )
-    rows = cursor.fetchall()
-
-    return rows, number_of_rows, max_page
-
-
-def setup_frame_and_list(rows, page, list_settings):
-    destroy_current_frame()
-    word_list_frame = tk.Frame(root, bg="linen")
-    word_list_frame.pack(fill="both", expand=True)
-    global current_frame
-    current_frame = word_list_frame
-
-    for i, dict_tuple in enumerate(rows, start=1 + page * 10):
-        button = tk.Button(
-            word_list_frame,
-            text=f"{i}) {dict_tuple[1]}",
-            wraplength=600,
-            anchor="center",
-            width=75,
-            command=lambda t=dict_tuple: editing_menu(t, list_settings=list_settings),
-        )
-        button.pack(anchor="w", padx=3)
-
-    return word_list_frame
-
-
-def lower_navigation(word_list_frame, number_of_rows, sort_arg, max_page, page):
-    lower_frame = tk.Frame(word_list_frame, bg="linen")
-    lower_frame.pack(side="bottom", pady=(0, 5))
-
-    back_button = tk.Button(word_list_frame, text="...", command=lambda: (main_menu()))
-    back_button.place(x=2, y=412)
-
-    if number_of_rows > 10:
-        specific_page_edit_entry = tk.Entry(lower_frame, width=5)
-        specific_page_edit_entry.pack(side="left")
-        go_to_page = tk.Button(
-            lower_frame,
-            text="Перейти",
-            command=lambda: word_list(
-                sort_arg,
-                page=input_validation(specific_page_edit_entry.get(), max_page, page),
-            ),
-        )
-        go_to_page.pack(side="left")
-
-
-def page_buttons(word_list_frame, page, max_page, number_of_rows, sort_arg, order_arg):
-    forward_back_frame = tk.Frame(word_list_frame, bg="linen")
-    forward_back_frame.pack(side="bottom", pady=3)
-
-    if page > 0:
-        prev_button = tk.Button(
-            forward_back_frame,
-            text="Назад",
-            command=lambda: word_list(sort_arg, page=page - 1, order_arg=order_arg),
-        )
-        prev_button.pack(side="left")
-
-    if page > 0 or (page * 10) + 10 < number_of_rows:
-        page_label = tk.Label(
-            forward_back_frame, text=f"Страница {page + 1}/{max_page + 1}", bg="linen"
-        )
-        page_label.pack(side="left")
-
-    if (page * 10) + 10 < number_of_rows:
-        next_button = tk.Button(
-            forward_back_frame,
-            text="Вперёд",
-            command=lambda: word_list(sort_arg, page=page + 1, order_arg=order_arg),
-        )
-        next_button.pack(side="left")
-
-
-def sorting_buttons(word_list_frame, sort_arg, order_arg, page):
-    sorting_frame = tk.Frame(word_list_frame, bg="linen")
-    sorting_frame.pack(side="bottom")
-
-    selected_option = tk.StringVar()
-    selected_option.set(sort_arg)
-
-    s_button_text = "Сортировать по ↑" if order_arg == 0 else "Сортировать по ↓"
-    sort_button = tk.Button(
-        sorting_frame,
-        text=s_button_text,
-        command=lambda: word_list(
-            selected_option.get(),
-            prev_sort_arg=sort_arg,
-            order_arg=order_arg,
-            sort_clicked=1,
-            page=page,
-        ),
-    )
-    sort_button.pack(side="left")
-
-    dropdown = tk.OptionMenu(
-        sorting_frame,
-        selected_option,
-        "дате изменения",
-        "алфавиту",
-        "дате создания",
-    )
-    dropdown.pack(side="left")
-
-
-def input_validation(input_value, max_page, current_page):
-    try:
-        res = int(input_value)
-        if res - 1 <= max_page and res > 0:
-            return res - 1
-        else:
-            return current_page
-    except ValueError:
-        return current_page
-
-
-#####################################################################################################################################################
-# LEARN PAGE
-#####################################################################################################################################################
-
-
-def learn(the_word=None, reverse_side=0, advance=0):
-    if is_dict_empty() == True:
-        messagebox.showerror(
-            "Ошибка!", "Словарь пуст. Добавьте слова, чтобы начать их изучение"
-        )
-        return
-
-    learning_stages = {
-        1: {"sql": None, "rus": "<1 мин"},
-        2: {"sql": "+5 minute", "rus": "<5 мин"},
-        3: {"sql": "+10 minute", "rus": "<10 мин"},
-        4: {"sql": "+1 hour", "rus": "<1 час"},
-        5: {"sql": "+1 day", "rus": "1 день"},
-        6: {"sql": "+3 day", "rus": "3 дней"},
-        7: {"sql": "+7 day", "rus": "7 дней"},
-        8: {"sql": "+14 day", "rus": "14 дней"},
-        9: {"sql": "+21 day", "rus": "21 дней"},
-        10: {"sql": "+1 month", "rus": "1 месяц"},
-        11: {"sql": "+2 month", "rus": "2 месяца"},
-        12: {"sql": "+3 month", "rus": "3 месяца"},
-        13: {"sql": "+6 month", "rus": "6 месяцев"},
-        14: {"sql": "+9 month", "rus": "9 месяцев"},
-        15: {"sql": "+12 month", "rus": "1 год"},
-    }
-
-    if not the_word:
-        the_word, dict_tuple = get_word_to_learn(advance, learning_stages)
-        if not the_word:
+class StudyController:
+    def __init__(self, view, planner, router):
+        self.view = view
+        self.planner = planner
+        self.router = router
+        self._card = None
+        self._advance_days = 0
+
+    def start(self, advance_days=0):
+        self._advance_days = advance_days
+        word = self.planner.next_word(advance_days)
+        if word is None:
+            self._offer_extension()
             return
+        self._card = word
+        self._show_card(revealed=False)
 
-    else:
-        cursor.execute("""SELECT * FROM dictionary WHERE word=?;""", (the_word,))
-        dict_tuple = cursor.fetchone()
+    def reveal_card(self):
+        self._show_card(revealed=True)
 
-    learn_frame = set_learning_frame()
-    display_word_to_learn(learn_frame, dict_tuple, reverse_side)
-    stage_buttons(learn_frame, dict_tuple, reverse_side, learning_stages, advance)
+    def grade_word(self, stage):
+        result = self.planner.reschedule(self._card.text, stage)
+        if not result.success:
+            self.view.show_error(_db_error_text(result.code, result.detail))
+        self.start(self._advance_days)
 
+    def open_main_menu(self):
+        self.router.open_main_menu()
 
-def set_learning_frame():
-    destroy_current_frame()
-    learn_frame = tk.Frame(root, bg="linen")
-    learn_frame.pack(fill="both", expand=True)
-    global current_frame
-    current_frame = learn_frame
-    return learn_frame
+    def _show_card(self, revealed):
+        stages = self.planner.answer_stages(self._card.stage)
+        self.view.switch_screen(LearnUI, self, self._card, revealed, stages)
 
-
-def get_word_to_learn(advance, learning_stages):
-    how_much_adv = f"+{advance} day"
-
-    cursor.execute(
-        "SELECT * FROM dictionary WHERE revision_date <= DATETIME('now',?);",
-        (how_much_adv,),
-    )
-    to_revise = cursor.fetchall()
-
-    if to_revise:
-        dict_tuple = random.choice(to_revise)
-        return dict_tuple[1], dict_tuple
-
-    for i in range(2, 5):
-        cursor.execute(
-            "SELECT * FROM dictionary WHERE revision_date <= DATETIME('now',?);",
-            (learning_stages[i]["sql"],),
-        )
-        to_revise = cursor.fetchall()
-        if to_revise:
-            dict_tuple = random.choice(to_revise)
-            return dict_tuple[1], dict_tuple
-    res = extend_revision()
-    return res
+    def _offer_extension(self):
+        raw = self.view.ask_advance_days()
+        if raw:
+            try:
+                days = int(raw)
+                if days > 0:
+                    self.start(days)
+                    return
+            except ValueError:
+                pass
+            self.view.show_error(
+                "Вы ввели недопустимое значение.", title="Ошибка!")
+        self.router.open_main_menu()
 
 
-def extend_revision():
-    revise_on = simpledialog.askstring(
-        "Отлично!",
-        "Все слова на сейчас повторены.\nЕсли хотите, выберите на сколько дней\nхотите идти вперёд плана",
-    )
+class AppController:
+    def __init__(self):
+        self.db = DBManager()
+        self.fetcher = Fetcher()
+        self.words_adder = WordsAdder(self.db, self.fetcher)
+        self.planner = StudyPlanner(self.db)
+        self.view = MainWindow()
+        self.list_ctrl = WordListController(self.view, self.db, router=self)
+        self.add_ctrl = AddWordController(
+            self.view, self.words_adder, router=self)
+        self.edit_ctrl = EditWordController(
+            self.view, self.db, self.planner, router=self)
+        self.study_ctrl = StudyController(self.view, self.planner, router=self)
 
-    if revise_on:
-        valid_revise_on = advance_validation(revise_on)
-        if valid_revise_on:
-            learn(advance=valid_revise_on)
-        else:
-            messagebox.showerror("Ошибка!", "Вы ввели недопустимое значение")
-            main_menu()
-    else:
-        main_menu()
-    return None, None
+    def run(self):
+        self.open_main_menu()
+        self.view.mainloop()
 
+    def open_main_menu(self):
+        self.view.switch_screen(MainMenuUI, self)
 
-def display_word_to_learn(learn_frame, dict_tuple, reverse_side):
-    learn_text = f"{dict_tuple[1]}" if reverse_side == 0 else dict_tuple[2]
+    def quit(self):
+        self.view.quit()
 
-    if reverse_side == 0:
-        label = tk.Label(learn_frame, text=learn_text, font=("Arial", 20), bg="linen")
-        label.pack(pady=20)
-    else:
-        card_displayed = tk.scrolledtext.ScrolledText(
-            learn_frame, wrap="word", height=15, width=70
-        )
-        card_displayed.pack(side="top", pady=10)
-        card_displayed.insert("1.0", learn_text)
+    def open_word_list(self):
+        if self._guard_not_empty():
+            self.list_ctrl.show()
 
+    def handle_add_request(self, request):
+        self.add_ctrl.handle_add_request(request)
 
-def stage_buttons(learn_frame, dict_tuple, reverse_side, learning_stages, advance):
-    the_word = dict_tuple[1]
-    stage_number = dict_tuple[5]
+    def open_edit(self, word, mode, from_list):
+        self.edit_ctrl.show(word, mode, from_list)
 
-    navigation_frame = tk.Frame(learn_frame, bg="linen")
-    navigation_frame.pack(pady=10, side="bottom")
-    back = tk.Button(learn_frame, text="...", command=main_menu)
-    back.place(x=2, y=412)
+    def open_learn(self, advance_days=0):
+        if self._guard_not_empty():
+            self.study_ctrl.start(advance_days)
 
-    learn_button_frame = tk.Frame(learn_frame, bg="linen")
-    learn_button_frame.pack(pady=10, side="bottom")
-
-    if reverse_side == 0:
-        button_show = tk.Button(
-            learn_button_frame,
-            text="Показать",
-            command=lambda: learn(the_word=the_word, reverse_side=1, advance=advance),
-        )
-        button_show.pack(side="left", padx=5, pady=20)
-    else:
-        button1 = tk.Button(
-            learn_button_frame,
-            text="<1 мин",
-            command=lambda: change_stage(
-                the_word, 1, change_rev_date=None, advance=advance
-            ),
-        )
-        button1.pack(side="left", padx=5, pady=20)
-
-        if stage_number != 1:
-            button2 = tk.Button(
-                learn_button_frame,
-                text=f'{learning_stages[stage_number]["rus"]}',
-                command=lambda: change_stage(
-                    the_word,
-                    stage_number,
-                    learning_stages[stage_number]["sql"],
-                    advance=advance,
-                ),
-            )
-            button2.pack(side="left", padx=5, pady=20)
-
-        button3 = tk.Button(
-            learn_button_frame,
-            text=f'{learning_stages[stage_number+1]["rus"]}',
-            command=lambda: change_stage(
-                the_word,
-                stage_number + 1,
-                learning_stages[stage_number + 1]["sql"],
-                advance=advance,
-            ),
-        )
-        button3.pack(side="left", padx=5, pady=20)
-
-        if stage_number != 15:
-            button4 = tk.Button(
-                learn_button_frame,
-                text=f'{learning_stages[stage_number+2]["rus"]}',
-                command=lambda: change_stage(
-                    the_word,
-                    stage_number + 2,
-                    learning_stages[stage_number + 2]["sql"],
-                    advance=advance,
-                ),
-            )
-            button4.pack(side="left", padx=5, pady=20)
+    def _guard_not_empty(self):
+        if self.db.is_dict_empty():
+            self.view.show_error(
+                "Словарь пуст. Добавьте слова, чтобы начать их изучение.", title="Ошибка!")
+            self.open_main_menu()
+            return False
+        return True
 
 
-def change_stage(word, stage, change_rev_date, advance=None, nullify=None):
-    if stage > 15:
-        stage = 15
-
-    query = (
-        """
-        UPDATE dictionary
-        SET stage = ?, 
-            revision_date = DATETIME(revision_date, ?),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE word = ?;
-    """
-        if change_rev_date
-        else """
-        UPDATE dictionary
-        SET stage = ?, 
-            revision_date = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE word = ?;
-    """
-    )
-    params = (stage, change_rev_date, word) if change_rev_date else (stage, word)
-
-    cursor.execute(query, params)
-    connection.commit()
-
-    if nullify:
-        messagebox.showinfo("Уведомление", "Прогресс изучения обнулён")
-    else:
-        learn(advance=advance)
-
-
-def advance_validation(revise_on):
-    try:
-        int_revise_on = int(revise_on)
-        return int_revise_on if int_revise_on > 0 else None
-    except ValueError:
-        return None
-
-
-#####################################################################################################################################################
-# MAIN MENU
-#####################################################################################################################################################
-def main_menu():
-
-    destroy_current_frame()
-    global current_frame
-    main_menu_frame = tk.Frame(root, bg="linen")
-
-    current_frame = main_menu_frame
-
-    search_edit_entry = tk.Entry(main_menu_frame, width=30)
-    search_edit_entry.pack(pady=(60, 20))
-
-    search_button = tk.Button(
-        main_menu_frame,
-        text="Найти слово",
-        width=25,
-        fg="Black",
-        command=lambda: what_to_add(search_edit_entry.get()),
-    )
-    search_button.pack(pady=15, anchor="center")
-
-    list_button = tk.Button(
-        main_menu_frame, text="Список слов", width=25, command=word_list
-    )
-    list_button.pack(pady=15, anchor="center")
-
-    learn_button = tk.Button(
-        main_menu_frame, text="Учить слова", width=25, command=learn
-    )
-    learn_button.pack(pady=15, anchor="center")
-
-    exit_button = tk.Button(main_menu_frame, text="Выйти", width=25, command=root.quit)
-    exit_button.pack(pady=15, anchor="center")
-
-    main_menu_frame.pack(fill="both", expand=True)
-
-
-#####################################################################################################################################################
-# GUI AND SQL SETUP
-#####################################################################################################################################################
-root = tk.Tk()
-root.title("Language App")
-root.geometry("600x450")
-root.configure(bg="linen")
-current_frame = None
-connection = sqlite3.connect("words.db")
-cursor = connection.cursor()
-cursor.execute(
-    """CREATE TABLE IF NOT EXISTS dictionary (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    word TEXT UNIQUE NOT NULL,
-    definition TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    stage INTEGER CHECK (stage BETWEEN 1 AND 15) DEFAULT 1,
-    revision_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-)
-
-main_menu()
-root.mainloop()
-
-cursor.close()
-connection.close()
+if __name__ == "__main__":
+    AppController().run()
